@@ -171,6 +171,15 @@ type summary struct {
 	Offset    int64
 	Synced    string
 
+	// Encryption (crypt.go): preamble metadata plus what we managed to do
+	// with it.
+	Enc          encInfo
+	Decrypted    bool
+	EncScheme    string
+	EncKeySource string
+	EncNote      string
+	EncEmptyRB   bool // decrypted fine, but the ring buffer holds no write-sets
+
 	Runs        int   // contiguous binlog runs found (~ write-sets w/ row/DDL data)
 	RangeKnown  bool  // preamble carried a valid retained seqno range
 	SeqnoChecked bool // whether per-run seqno attribution was performed
@@ -194,7 +203,7 @@ type summary struct {
 
 const (
 	appName = "gcache-inspector"
-	version = "0.1.0"
+	version = "0.2.0"
 )
 
 var (
@@ -221,7 +230,30 @@ func main() {
 		fmt.Printf("%s %s\n", appName, version)
 		fmt.Printf("Usage: %s --file /path/to/galera.cache [--summary-only] [--top 20]\n", appName)
 		fmt.Println("       [--detail] [--decode-rows [--limit 50]] [--include-stale] [--live-only] [--debug]")
+		fmt.Println("Encrypted caches:")
+		fmt.Println("       [--keyring-file /path/component_keyring_file | --master-key HEX |")
+		fmt.Println("        --vault-url URL --vault-token TOKEN [--vault-mount m] [--vault-path p]]")
+		fmt.Println("       [--dump-preamble] [--enc-probe] [--file-key HEX]")
+		fmt.Println("       [--enc-scheme S --enc-page-size N --enc-base OFF]")
 		os.Exit(1)
+	}
+
+	if *dumpPreamble {
+		if err := dumpPreambleText(*filePath); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *encProbe {
+		data, err := os.ReadFile(*filePath)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		printProbe(*filePath, data, probe(data))
+		return
 	}
 
 	sum, err := parseGCache(*filePath)
@@ -254,10 +286,15 @@ func parseGCache(path string) (*summary, error) {
 	parsePreamble(data, sum)
 	sum.RangeKnown = sum.HasSeqno && sum.SeqnoMin > 0 && sum.SeqnoMax >= sum.SeqnoMin
 
-	// 2. Deep-scan the whole file for binlog write-set payloads.
+	// 2. If the cache is encrypted, decrypt the ring buffer in memory. On
+	//    failure this returns the original bytes and records why on the
+	//    summary, so the header info is still printed.
+	data = maybeDecrypt(data, sum)
+
+	// 3. Deep-scan the whole file for binlog write-set payloads.
 	scan(data, sum)
 
-	// 3. Attribute Galera seqnos only when per-write-set output is requested -
+	// 4. Attribute Galera seqnos only when per-write-set output is requested -
 	//    the header scan isn't needed for the plain summary, so we skip it there
 	//    to keep that path fast.
 	if *detail || *decodeRows || *debug {
@@ -265,7 +302,7 @@ func parseGCache(path string) (*summary, error) {
 		sum.SeqnoChecked = true
 	}
 
-	// 4. Roll up per-run stats into the summary totals.
+	// 5. Roll up per-run stats into the summary totals.
 	aggregate(sum)
 
 	// Keep the decode pass able to re-read the bytes.
@@ -285,6 +322,7 @@ func parsePreamble(data []byte, s *summary) {
 		}
 		key := strings.TrimSpace(line[:strings.IndexByte(line, ':')])
 		val := strings.TrimSpace(line[strings.IndexByte(line, ':')+1:])
+		s.Enc.note(key, val) // encryption keys differ per build; see crypt.go
 		switch strings.ToLower(key) {
 		case "version":
 			fmt.Sscanf(val, "%d", &s.Version)
@@ -1137,6 +1175,7 @@ func printSummary(s *summary, top int) {
 		}
 		fmt.Printf("%s %s   %s %s\n", dim("Synced: "), syncStr, dim("Offset:"), fmt.Sprintf("%d", s.Offset))
 	}
+	printEncryption(s)
 	fmt.Printf("%s %s\n", dim("Flavor: "), id(flavor))
 
 	// Write-set counts
@@ -1178,6 +1217,24 @@ func printSummary(s *summary, top int) {
 	if *summaryOnly || len(s.Tables) == 0 {
 		if len(s.Tables) == 0 {
 			fmt.Println()
+			if s.Enc.Encrypted && !s.Decrypted {
+				fmt.Printf("%s\n", warn("The cache is encrypted and was not decrypted, so no write-sets could be read."))
+				fmt.Printf("%s\n", dim("Supply the master key with --keyring-file / --master-key / --vault-url."))
+				return
+			}
+			if s.Enc.Encrypted && s.Decrypted {
+				if s.EncEmptyRB {
+					fmt.Printf("%s\n", good("The cache decrypted correctly, and the ring buffer is empty."))
+					fmt.Printf("%s\n", dim("Only the header area after the preamble holds data; everything from start_ onward"))
+					fmt.Printf("%s\n", dim("is zeros. No write-sets are persisted in this file. The seqnos a running node"))
+					fmt.Printf("%s\n", dim("reports (wsrep_local_cached_downto..wsrep_last_committed) live in memory; copy the"))
+					fmt.Printf("%s\n", dim("cache from a node that has flushed write traffic, or after a non-empty clean shutdown."))
+					return
+				}
+				fmt.Printf("%s\n", good("The cache decrypted successfully, but holds no row-based write-sets."))
+				fmt.Printf("%s\n", dim("Run with --debug for a byte census, or --dump-decrypted to inspect the plaintext."))
+				return
+			}
 			fmt.Printf("%s\n", warn("No row-based write-sets were decoded."))
 			fmt.Printf("%s\n", dim("If the cluster runs binlog_format=STATEMENT or the data lies in gcache.page.* files,"))
 			fmt.Printf("%s\n", dim("point --file at those, or run with --debug."))
@@ -1229,6 +1286,7 @@ func printSummary(s *summary, top int) {
 
 func printDebug(s *summary) {
 	fmt.Printf("\n%s\n", hi("--- debug ---"))
+	printEncDebug(s)
 	fmt.Printf("%s\n", dim("Seqno attribution: gcache BufferHeader (size@+16, flags@+20, store@+22), seqno from header/payload"))
 	fmt.Printf("  %s %s\n", dim("valid BufferHeaders found:"), fmt.Sprintf("%d", s.CandCount))
 	fmt.Printf("  %s %s, %s %s",
