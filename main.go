@@ -132,6 +132,7 @@ type runRec struct {
 	ddlText    []string
 	tables     map[string]*tableStats
 	seqno      int64 // Galera global seqno, or -1 if not attributable (stale)
+	ts         int64 // commit time (unix seconds) from the binlog event header, 0 if unknown
 	live       bool
 }
 
@@ -173,12 +174,13 @@ type summary struct {
 
 	// Encryption (crypt.go): preamble metadata plus what we managed to do
 	// with it.
-	Enc          encInfo
-	Decrypted    bool
-	EncScheme    string
-	EncKeySource string
-	EncNote      string
-	EncEmptyRB   bool // decrypted fine, but the ring buffer holds no write-sets
+	Enc           encInfo
+	Decrypted     bool
+	EncScheme     string
+	EncKeySource  string
+	EncNote       string
+	EncEmptyRB    bool // decrypted fine, but the ring buffer holds no write-sets
+	EncPlainImage bool // says encrypted, but the payload already is not (a --dump-decrypted image)
 
 	Runs        int   // contiguous binlog runs found (~ write-sets w/ row/DDL data)
 	RangeKnown  bool  // preamble carried a valid retained seqno range
@@ -192,6 +194,9 @@ type summary struct {
 	SizeOff     int   // auto-detected BufferHeader size-field offset (diagnostics)
 	CandCount   int   // header seqno candidates found (diagnostics)
 	GTIDs       int   // GTID events seen (~ transactions)
+	TSMin       int64 // oldest / newest write-set commit time seen (unix seconds)
+	TSMax       int64
+	TSCount     int // write-sets we could date
 	RowsChanged uint64  // total modified rows (not binlog events)
 	RowBytes    uint64
 	EventHist   map[byte]uint64
@@ -203,38 +208,76 @@ type summary struct {
 
 const (
 	appName = "gcache-inspector"
-	version = "0.2.0"
+	version = "0.2.5"
 )
 
 var (
 	filePath     = flag.String("file", "", "Path to galera.cache file")
 	summaryOnly  = flag.Bool("summary-only", false, "Show only the header summary, skip the table breakdown")
+	noSummary    = flag.Bool("no-summary", false, "Skip the summary entirely (header and tables), printing only --detail / --decode-rows output")
 	topN         = flag.Int("top", 10, "Number of top tables to show")
 	detail       = flag.Bool("detail", false, "List each write-set: seqno, size, flags, table ops, DDL count")
 	debug        = flag.Bool("debug", false, "Show event-type histogram and header auto-calibration diagnostics")
 	decodeRows   = flag.Bool("decode-rows", false, "Decode each row event into mysqlbinlog DECODE-ROWS -v style output")
-	limit        = flag.Int("limit", 0, "When decoding, max number of write-sets to print (0 = all)")
+	limit        = flag.Int("limit", 0, "Max write-sets to list or decode (0 = all; ignored when --seqno is used)")
 	includeStale = flag.Bool("include-stale", false, "Also include stale write-sets (leftovers from earlier ring-buffer cycles)")
 	liveOnly     = flag.Bool("live-only", false, "Restrict table/row aggregates to retained write-sets (in the seqno range)")
+	seqnoSpec    = flag.String("seqno", "", "Only show these seqnos: N, A-B, A-, -B, or a comma-separated mix (implies --detail)")
+	utcTimes     = flag.Bool("utc", false, "Print write-set timestamps in UTC instead of local time")
+	fastScan     = flag.Bool("fast", false, "Skip the BufferHeader scan: no seqnos, flags or retained/stale split, but ~2x faster")
+	noProgress   = flag.Bool("no-progress", false, "Never draw the progress bar on stderr")
 	showVersion  = flag.Bool("version", false, "Print version and exit")
 )
+
+// seqFilter is the parsed --seqno spec (nil when the flag is unused).
+var seqFilter *seqnoFilter
 
 func main() {
 	flag.Parse()
 	initColor()
+	initProgress()
 	if *showVersion {
 		fmt.Printf("%s %s\n", appName, version)
 		return
 	}
 	if *filePath == "" {
 		fmt.Printf("%s %s\n", appName, version)
-		fmt.Printf("Usage: %s --file /path/to/galera.cache [--summary-only] [--top 20]\n", appName)
-		fmt.Println("       [--detail] [--decode-rows [--limit 50]] [--include-stale] [--live-only] [--debug]")
+		fmt.Printf("Usage: %s --file /path/to/galera.cache [--summary-only | --no-summary] [--top 20]\n", appName)
+		fmt.Println("       [--detail] [--decode-rows] [--limit 50] [--seqno 1200-1300] [--utc]")
+		fmt.Println("       [--include-stale] [--live-only] [--fast] [--no-progress] [--debug]")
 		fmt.Println("Encrypted caches:")
 		fmt.Println("       [--keyring-file /path/component_keyring_file | --master-key HEX |")
 		fmt.Println("        --vault-url URL --vault-token TOKEN [--vault-mount m] [--vault-path p]]")
 		fmt.Println("       [--dump-preamble] [--enc-probe] [--file-key HEX]")
 		fmt.Println("       [--enc-scheme S --enc-page-size N --enc-base OFF]")
+		os.Exit(1)
+	}
+
+	if *noSummary && *summaryOnly {
+		fmt.Println("Error: --no-summary and --summary-only ask for opposite things")
+		os.Exit(1)
+	}
+
+	var perr error
+	if seqFilter, perr = parseSeqnoSpec(*seqnoSpec); perr != nil {
+		fmt.Printf("Error: %v\n", perr)
+		os.Exit(1)
+	}
+	if seqFilter != nil {
+		if *fastScan {
+			fmt.Println("Error: --seqno needs the seqno attribution that --fast skips")
+			os.Exit(1)
+		}
+		if *limit > 0 {
+			fmt.Fprintf(os.Stderr, "%s\n",
+				warn("Note: --limit is ignored when --seqno selects the write-sets."))
+		}
+		if !*detail && !*decodeRows {
+			*detail = true // selecting write-sets without asking to see them
+		}
+	}
+	if *noSummary && !*detail && !*decodeRows && !*debug {
+		fmt.Println("Error: --no-summary leaves nothing to print; add --detail or --decode-rows")
 		os.Exit(1)
 	}
 
@@ -247,7 +290,7 @@ func main() {
 	}
 
 	if *encProbe {
-		data, err := os.ReadFile(*filePath)
+		data, err := readFileProgress(*filePath)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
@@ -271,7 +314,7 @@ func main() {
 }
 
 func parseGCache(path string) (*summary, error) {
-	data, err := os.ReadFile(path)
+	data, err := readFileProgress(path)
 	if err != nil {
 		return nil, err
 	}
@@ -288,16 +331,18 @@ func parseGCache(path string) (*summary, error) {
 
 	// 2. If the cache is encrypted, decrypt the ring buffer in memory. On
 	//    failure this returns the original bytes and records why on the
-	//    summary, so the header info is still printed.
+	//    summary, so the header info is still printed. Progress for the heavy
+	//    steps is handled inside maybeDecrypt, which also prompts and warns.
 	data = maybeDecrypt(data, sum)
 
 	// 3. Deep-scan the whole file for binlog write-set payloads.
 	scan(data, sum)
 
-	// 4. Attribute Galera seqnos only when per-write-set output is requested -
-	//    the header scan isn't needed for the plain summary, so we skip it there
-	//    to keep that path fast.
-	if *detail || *decodeRows || *debug {
+	// 4. Attribute Galera seqnos. This is a second pass over the file, so it is
+	//    the expensive half of a run, but without it the summary can't tell the
+	//    user which seqnos are actually in the cache - which is what makes
+	//    --seqno usable. --fast opts out when only the table ranking is wanted.
+	if !*fastScan {
 		attributeSeqnos(data, sum)
 		sum.SeqnoChecked = true
 	}
@@ -443,7 +488,14 @@ func identOK(b []byte) bool {
 func scan(data []byte, s *summary) {
 	p := 0
 	n := len(data)
+	pr := newProgBytes("scanning write-sets", int64(n))
+	defer pr.finish()
+	var next int
 	for p < n-headerLen {
+		if p >= next { // throttled: one atomic store per 64 kB, not per byte
+			pr.set(int64(p))
+			next = p + progStep
+		}
 		ttype, size, ok := readEvent(data, p)
 		anchor := false
 		if ok {
@@ -473,6 +525,11 @@ func scan(data []byte, s *summary) {
 				break
 			}
 			s.EventHist[et]++
+			if rec.ts == 0 {
+				// Every binlog event header starts with the origin node's commit
+				// time; the first plausible one dates the whole write-set.
+				rec.ts = eventTime(data, rp)
+			}
 			switch {
 			case et == evGTIDLog || et == evMariaGTID:
 				s.GTIDs++
@@ -684,7 +741,13 @@ func attributeSeqnos(data []byte, s *summary) {
 		seqno   int64
 	}
 	var bhs []bhdr
+	pr := newProgBytes("locating buffer headers", int64(n))
+	next := 0
 	for H := 0; H+bhSize <= n; H++ {
+		if H >= next {
+			pr.set(int64(H))
+			next = H + progStep
+		}
 		if data[H+22] != bhInRB {
 			continue
 		}
@@ -705,6 +768,7 @@ func attributeSeqnos(data []byte, s *summary) {
 		}
 		bhs = append(bhs, bhdr{H, size, flags, seqno})
 	}
+	pr.finish()
 	s.CandCount = len(bhs)
 	if len(bhs) == 0 {
 		return
@@ -875,8 +939,8 @@ func attributeSeqnos(data []byte, s *summary) {
 }
 
 // aggregate rolls per-run stats into the summary totals. When seqno attribution
-// wasn't performed (plain summary), every run is included and no live/stale split
-// is computed. With attribution, --live-only restricts to retained write-sets.
+// wasn't performed (--fast), every run is included and no live/stale split is
+// computed. With attribution, --live-only restricts to retained write-sets.
 func aggregate(s *summary) {
 	s.Tables = map[string]*tableStats{}
 	for _, r := range s.RunList {
@@ -889,6 +953,15 @@ func aggregate(s *summary) {
 			if *liveOnly && !r.live {
 				continue
 			}
+		}
+		if r.ts > 0 {
+			if s.TSMin == 0 || r.ts < s.TSMin {
+				s.TSMin = r.ts
+			}
+			if r.ts > s.TSMax {
+				s.TSMax = r.ts
+			}
+			s.TSCount++
 		}
 		s.DDLCount += r.ddl
 		for name, t := range r.tables {
@@ -951,6 +1024,19 @@ func selectedRuns(s *summary) []*runRec {
 		}
 		return int64(1) << 62 // unattributed sort last
 	}
+	// An explicit --seqno overrides the retained/stale logic entirely: if the
+	// user names a seqno we show it whether or not it is still retained, and we
+	// never silently include neighbours.
+	if seqFilter != nil {
+		var out []*runRec
+		for _, r := range s.RunList {
+			if r.seqno > 0 && seqFilter.match(r.seqno) {
+				out = append(out, r)
+			}
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].seqno < out[j].seqno })
+		return out
+	}
 	// Show all runs (labeled by seqno) when attribution found nothing, or when
 	// no run falls in the retained range - e.g. the retained write-sets carry no
 	// row data and the decodable ones are all just-older (seen on PXC 8.4.8).
@@ -994,10 +1080,58 @@ func addRow(m map[string]*tableStats, name, op string, sz uint64, rows int) {
 	t.Bytes += sz
 }
 
+// limitN returns the effective --limit for the listing modes. An explicit
+// --seqno selection is already the user's cap, so --limit is ignored there:
+// silently truncating a range the user spelled out would hide write-sets they
+// specifically asked for.
+func limitN() int {
+	if seqFilter != nil || *limit < 0 {
+		return 0
+	}
+	return *limit
+}
+
+// noteEmptySelection explains an empty --detail/--decode-rows listing, which
+// otherwise looks like a bug. Almost always it is a --seqno outside the range
+// the cache actually holds, so print that range.
+func noteEmptySelection(s *summary) {
+	if seqFilter == nil {
+		return
+	}
+	fmt.Printf("\n%s\n", warn(fmt.Sprintf("No write-set matches --seqno %s.", seqFilter.String())))
+	if s.Attributed > 0 {
+		fmt.Printf("%s\n", dim(fmt.Sprintf("This cache holds seqnos %d – %d (%d decodable write-sets).",
+			s.DerivedMin, s.DerivedMax, s.Attributed)))
+		return
+	}
+	fmt.Printf("%s\n", dim("No seqno could be attributed to any write-set here; run with --debug."))
+}
+
 func printDetail(s *summary) {
 	runs := selectedRuns(s)
 	if len(runs) == 0 {
+		noteEmptySelection(s)
 		return
+	}
+	// --limit caps the listing the same way it caps --decode-rows. Every run
+	// prints exactly one line here, so a plain truncation is the whole story.
+	withheld := 0
+	if lim := limitN(); lim > 0 && lim < len(runs) {
+		withheld = len(runs) - lim
+		runs = runs[:lim]
+	}
+	anyTS := false
+	for _, r := range runs {
+		if r.ts > 0 {
+			anyTS = true
+			break
+		}
+	}
+	when := func(r *runRec) string {
+		if !anyTS {
+			return ""
+		}
+		return " " + dim(fmt.Sprintf("%-19s", fmtTime(r.ts)))
 	}
 	fmt.Printf("\n%s\n", hi("=== Write-sets ==="))
 	for _, r := range runs {
@@ -1011,15 +1145,19 @@ func printDetail(s *summary) {
 			if s.RangeKnown && !r.live {
 				tag = dim(" (old)")
 			}
-			who = fmt.Sprintf("%s %-10s %s%s",
+			// Pad inside the colour helpers: escape bytes are invisible but
+			// still count against %-Ns, which would wreck the alignment.
+			who = fmt.Sprintf("%s %s %s%s%s",
 				dim("seqno"),
-				id(fmt.Sprintf("%d", r.seqno)),
+				id(fmt.Sprintf("%-10d", r.seqno)),
 				dim(fmt.Sprintf("%9d B", sz)),
+				when(r),
 				tag)
 		} else {
-			who = fmt.Sprintf("%s %s",
+			who = fmt.Sprintf("%s %s%s",
 				dim(fmt.Sprintf("@0x%-9x", r.start)),
-				dim(fmt.Sprintf("%9d B", r.bytes())))
+				dim(fmt.Sprintf("%9d B", r.bytes())),
+				when(r))
 		}
 		if f := flagString(r); f != "" {
 			who += "  " + flagColored(f)
@@ -1037,6 +1175,10 @@ func printDetail(s *summary) {
 			}
 		}
 		fmt.Printf("  %s  %s\n", who, desc)
+	}
+	if withheld > 0 {
+		fmt.Printf("  %s\n", dim(fmt.Sprintf("... %d more write-set(s) not shown (--limit %d; use --limit 0 for all)",
+			withheld, limitN())))
 	}
 }
 
@@ -1082,24 +1224,40 @@ func firstLine(s string) string {
 
 func printDecode(s *summary) {
 	runs := selectedRuns(s)
-	total := len(runs)
-	if *limit > 0 && *limit < total {
-		total = *limit
+	if len(runs) == 0 {
+		noteEmptySelection(s)
+		return
 	}
-	progress := total > 200 // only bother for slow runs
+	lim := limitN()
+	total := len(runs)
+	if lim > 0 && lim < total {
+		total = lim
+	}
+	// Only show the bar when stdout is redirected. Decoding to a terminal
+	// scrolls the decoded rows past continuously, which is its own progress
+	// report, and a bar redrawn on stderr would just interleave with it.
+	pr := &prog{} // zero value: every method is a no-op
+	if !isTTY(os.Stdout) {
+		pr = newProgItems("decoding write-sets", int64(total))
+	}
+	defer pr.finish()
 	printed := 0
-	scanned := 0
-	for _, r := range runs {
-		if *limit > 0 && printed >= *limit {
+	for i, r := range runs {
+		if lim > 0 && printed >= lim {
 			break
 		}
-		scanned++
-		if progress && (scanned%100 == 0 || scanned == total) {
-			fmt.Fprintf(os.Stderr, "\rdecoding write-sets: %d/%d ...", scanned, total)
+		if lim > 0 {
+			pr.set(int64(printed)) // the cap is what "done" means here
+		} else {
+			pr.set(int64(i))
 		}
 		block := decodeRun(s.data, r)
 		if block == "" {
 			continue
+		}
+		when := ""
+		if r.ts > 0 {
+			when = dim(" at ") + id(fmtTime(r.ts))
 		}
 		if r.seqno > 0 {
 			sz := r.bufSize
@@ -1113,27 +1271,44 @@ func printDecode(s *summary) {
 			if f := flagString(r); f != "" {
 				tag += " " + flagColored(f)
 			}
-			fmt.Printf("\n%s %s %s%s\n%s",
+			fmt.Printf("\n%s %s %s%s%s\n%s",
 				dim("--"),
 				dim("seqno"),
 				id(fmt.Sprintf("%d", r.seqno)),
+				when,
 				dim(fmt.Sprintf(" (%d bytes)", sz))+tag,
 				block)
 		} else {
-			fmt.Printf("\n%s %s %s\n%s",
+			fmt.Printf("\n%s %s%s %s\n%s",
 				dim("--"),
 				dim(fmt.Sprintf("write-set @0x%x", r.start)),
+				when,
 				dim(fmt.Sprintf("(%d bytes, no seqno)", r.bytes())),
 				block)
 		}
 		printed++
 	}
-	if progress {
-		fmt.Fprintf(os.Stderr, "\rdecoding write-sets: %d/%d done\n", scanned, total)
-	}
+	pr.finish()
 }
 
 func printSummary(s *summary, top int) {
+	if *noSummary {
+		// The summary is where "encrypted but not decrypted" and "nothing was
+		// decoded" are normally explained. Suppressing it must not swallow
+		// those, or an empty decode looks like the tool did nothing - so they
+		// go to stderr, which keeps a redirected decode file clean.
+		if s.Enc.Encrypted && !s.Decrypted {
+			fmt.Fprintf(os.Stderr, "%s\n",
+				warn("The cache is encrypted and was not decrypted; no write-sets could be read."))
+		} else if len(s.Tables) == 0 {
+			fmt.Fprintf(os.Stderr, "%s\n",
+				warn("No row-based write-sets were decoded; re-run without --no-summary for why."))
+		}
+		if *debug {
+			printDebug(s)
+		}
+		return
+	}
 	flavor := "unknown"
 	switch {
 	case s.SawMaria || (s.SawV1 && !s.SawV2):
@@ -1183,7 +1358,7 @@ func printSummary(s *summary, top int) {
 	if !s.SeqnoChecked {
 		fmt.Printf("%s %s   %s\n",
 			hi("Write-sets found: "), fmt.Sprintf("%d", s.Runs),
-			dim("(use --detail for retained/stale split + per-write-set seqnos)"))
+			dim("(--fast: no seqnos, flags or retained/stale split)"))
 	} else if s.RangeKnown && s.Attributed == 0 {
 		fmt.Printf("%s %s  %s\n",
 			hi("Write-sets found: "), fmt.Sprintf("%d", s.Runs),
@@ -1197,6 +1372,27 @@ func printSummary(s *summary, top int) {
 		fmt.Printf("%s %s  %s\n",
 			hi("Write-sets found: "), fmt.Sprintf("%d", s.Runs),
 			dim(fmt.Sprintf("(seqno derived for %d; retained range unknown)", s.Attributed)))
+	}
+	// The seqnos that can actually be selected: this is the range to feed back
+	// into --seqno, and it is usually narrower than the preamble's retained
+	// range (write-sets without row data can't be decoded at all).
+	if s.Attributed > 0 {
+		fmt.Printf("%s %s – %s  %s\n",
+			hi("Decodable seqnos: "),
+			id(fmt.Sprintf("%d", s.DerivedMin)),
+			id(fmt.Sprintf("%d", s.DerivedMax)),
+			dim(fmt.Sprintf("(%d write-sets; pick one with --seqno)", s.Attributed)))
+	}
+	if s.TSCount > 0 {
+		extra := fmtAgo(s.TSMax)
+		if span := fmtSpan(s.TSMin, s.TSMax); span != "" && s.TSMin != s.TSMax {
+			extra = "span " + span + ", newest " + extra
+		}
+		fmt.Printf("%s %s – %s  %s\n",
+			hi("Time range:       "),
+			id(fmtTime(s.TSMin)),
+			id(fmtTimeZone(s.TSMax)),
+			dim("("+extra+")"))
 	}
 	fmt.Printf("%s %s\n", hi("DDL statements:   "), ddlColor(fmt.Sprintf("%d", s.DDLCount)))
 	fmt.Printf("%s %s\n", hi("GTID events seen: "), fmt.Sprintf("%d", s.GTIDs))
@@ -1287,6 +1483,15 @@ func printSummary(s *summary, top int) {
 func printDebug(s *summary) {
 	fmt.Printf("\n%s\n", hi("--- debug ---"))
 	printEncDebug(s)
+	fmt.Printf("%s %s %s\n",
+		dim("Write-set timestamps: binlog event header (origin node clock, 1s resolution);"),
+		fmt.Sprintf("%d/%d", s.TSCount, s.Runs),
+		dim("dated"))
+	if !s.SeqnoChecked {
+		fmt.Printf("%s\n", dim("Seqno attribution: skipped (--fast)"))
+		printEventHist(s)
+		return
+	}
 	fmt.Printf("%s\n", dim("Seqno attribution: gcache BufferHeader (size@+16, flags@+20, store@+22), seqno from header/payload"))
 	fmt.Printf("  %s %s\n", dim("valid BufferHeaders found:"), fmt.Sprintf("%d", s.CandCount))
 	fmt.Printf("  %s %s, %s %s",
@@ -1338,6 +1543,10 @@ func printDebug(s *summary) {
 		}
 		fmt.Printf("\n")
 	}
+	printEventHist(s)
+}
+
+func printEventHist(s *summary) {
 	fmt.Printf("%s\n", hi("Event-type histogram (within decoded runs):"))
 	type eh struct {
 		t byte

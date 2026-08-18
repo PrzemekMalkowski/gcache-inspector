@@ -1085,6 +1085,16 @@ func plaintextScore(buf []byte) int {
 	if n > 0 && zeros*4 >= n*3 {
 		score += 100
 	}
+	return score + structureScore(buf)
+}
+
+// structureScore counts framing that only survives correct decryption: framed
+// TABLE_MAP events and plausible BufferHeaders. Unlike the all-zeros test above
+// it says nothing about untouched regions of the ring buffer, which is what
+// makes it usable as evidence that a file is *already* in the clear.
+func structureScore(buf []byte) int {
+	score := 0
+	n := len(buf)
 	for p := 0; p+headerLen < n; p++ {
 		if buf[p+4] != evTableMap {
 			continue
@@ -1111,6 +1121,34 @@ func plaintextScore(buf []byte) int {
 		score++
 	}
 	return score
+}
+
+// alreadyPlaintext reports whether a file whose preamble advertises encryption
+// in fact holds a ring buffer that is already in the clear.
+//
+// --dump-decrypted writes exactly such a file: the preamble was never encrypted
+// to begin with, so it is copied verbatim and the dump keeps saying
+// enc_encrypted=1 even though everything after it is now plaintext. Without
+// this check, reading a dump back prompts for a master key it does not need.
+//
+// The test demands positive evidence - write-set framing in regions that were
+// actually written - rather than merely "does not look random". Ciphertext
+// essentially never produces a valid TABLE_MAP, so a handful of them is
+// conclusive; an encrypted cache scores zero here.
+func alreadyPlaintext(data []byte, pr probeResult) bool {
+	const enough = 30 // ~3 framed TABLE_MAP events
+	evidence := 0
+	for _, w := range writtenWindows(data, pr, 6) {
+		end := w + fastWin
+		if end > len(data) {
+			end = len(data)
+		}
+		evidence += structureScore(data[w:end])
+		if evidence >= enough {
+			return true
+		}
+	}
+	return false
 }
 
 const (
@@ -1349,6 +1387,26 @@ func maybeDecrypt(data []byte, s *summary) []byte {
 		return data
 	}
 
+	// Probe first: it needs no key, and its result decides whether we have to
+	// ask for one at all.
+	sp := newSpinner("probing cipher layout")
+	pr := probe(data)
+	sp.finish() // stop before printing: the spinner owns the stderr line
+	if *debug {
+		fmt.Fprintf(os.Stderr, "%s ciphertext at 0x%x, written up to %s, keystream period %d\n",
+			dim("enc probe:"), pr.CipherAt, zeroTailStr(pr), pr.Period)
+	}
+
+	// An image written by --dump-decrypted carries the original preamble, which
+	// still says "encrypted" because it never was. Recognise it and skip the
+	// whole key dance instead of prompting for a key that would do nothing.
+	if alreadyPlaintext(data, pr) {
+		s.Decrypted = true
+		s.EncPlainImage = true
+		s.EncScheme = "none — image is already decrypted"
+		return data
+	}
+
 	mk, err := resolveMasterKey(e)
 	if err != nil {
 		s.EncNote = err.Error()
@@ -1393,12 +1451,9 @@ func maybeDecrypt(data []byte, s *summary) []byte {
 		}
 	}
 
-	pr := probe(data)
-	if *debug {
-		fmt.Fprintf(os.Stderr, "%s ciphertext at 0x%x, written up to %s, keystream period %d\n",
-			dim("enc probe:"), pr.CipherAt, zeroTailStr(pr), pr.Period)
-	}
+	sp = newSpinner("calibrating cipher")
 	p, hits, ok := calibrate(data, keys, pr)
+	sp.finish()
 	if *debug {
 		fmt.Fprintf(os.Stderr, "%s %d file-key candidate(s), %d layout(s) scored above zero\n",
 			dim("enc calibration:"), len(keys), len(hits))
@@ -1415,7 +1470,9 @@ func maybeDecrypt(data []byte, s *summary) []byte {
 		fmt.Fprintf(os.Stderr, "%s %s\n", warn("Encrypted GCache:"), s.EncNote)
 		return data
 	}
+	sp = newSpinner("decrypting cache")
 	out := decryptAll(data, p)
+	sp.finish()
 	if out == nil {
 		s.EncNote = "decryption of the full file failed after calibration"
 		return data
@@ -1630,8 +1687,18 @@ func printEncryption(s *summary) {
 			state = good("yes — decrypted (ring buffer empty)")
 		}
 	}
+	if s.EncPlainImage {
+		// The preamble is stale, not the file: say so rather than implying we
+		// unwrapped a key we never touched.
+		state = good("per preamble, but this image is already plaintext")
+	}
 	fmt.Printf("%s %s   %s\n", dim("Encrypted:"), state,
 		dim(fmt.Sprintf("(enc version %d)", s.Enc.Version)))
+	if s.EncPlainImage {
+		fmt.Printf("%s %s\n", dim("Note:     "),
+			dim("no key needed — the preamble is copied verbatim into a --dump-decrypted image"))
+		return
+	}
 	if kid := s.Enc.masterKeyID(); kid != "" {
 		fmt.Printf("%s %s\n", dim("Master key:"), id(kid))
 	}
